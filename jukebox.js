@@ -1,7 +1,12 @@
 // jukebox.js — a party jukebox for your Spotify. Node 18+, no dependencies.
 //
-// Guests search for songs on a web page and add them to YOUR Spotify queue.
+// Guests search for songs on a web page, add them to a shared list, and vote songs up.
 // Only you (the host) ever log in to Spotify; guests just use the page.
+//
+// How voting works: Spotify doesn't let apps reorder its queue, so the jukebox keeps its
+// own list, sorted by votes. About 20 seconds before the current song ends, it hands the
+// top-voted song to Spotify's queue. That song is then locked in as "Playing next".
+// Between requests, whatever you started on Spotify (e.g. a playlist) keeps playing.
 //
 // Required settings (environment variables):
 //   SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET   from developer.spotify.com/dashboard
@@ -18,13 +23,16 @@
 //   PORT=8888                 port to listen on (Render sets this for you)
 //   REDIRECT_URI=...          must match the Redirect URI in your Spotify dashboard exactly.
 //                             Defaults to <Render URL>/callback on Render, else 127.0.0.1.
-//   COOLDOWN_SECONDS=30       how long each guest waits between requests
+//   COOLDOWN_SECONDS=30       how long each guest waits between adding songs (votes are unlimited)
+//   LEAD_SECONDS=20           how long before a song ends to hand the next one to Spotify
 //   ALLOW_EXPLICIT=false      hide and block songs Spotify marks as Explicit (the "E" label)
 //   WORD_FILTER=off           turn off the rude-word filter (it's on by default)
 //   EXTRA_BLOCKED_WORDS=a,b   more words to block, comma-separated (whole words)
 //   SPOTIFY_REFRESH_TOKEN=... lets the jukebox log itself back in after a restart on hosts
 //                             that wipe files (e.g. Render's free tier). The /callback page
 //                             shows you this value after you log in.
+//
+// The song list and votes live in memory, so they reset if the server restarts.
 
 const http = require('node:http');
 const fs = require('node:fs');
@@ -38,9 +46,11 @@ const REDIRECT_URI = process.env.REDIRECT_URI
   || `http://127.0.0.1:${PORT}/callback`;
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 30) * 1000;
+const LEAD_MS = Number(process.env.LEAD_SECONDS || 20) * 1000;
 const ALLOW_EXPLICIT = process.env.ALLOW_EXPLICIT !== 'false';
 const WORD_FILTER = process.env.WORD_FILTER !== 'off';
-const DUPLICATE_WINDOW_MS = 60 * 60 * 1000; // same song can't be re-requested within 1 hour
+const DUPLICATE_WINDOW_MS = 60 * 60 * 1000; // a song can't be requested again within 1 hour of playing
+const MAX_WAITING = 100;                    // most songs the list will hold at once
 const TOKEN_FILE = 'tokens.json';
 const SCOPES = 'user-modify-playback-state user-read-playback-state user-read-currently-playing';
 
@@ -127,8 +137,6 @@ async function spotify(method, path) {
   return data;
 }
 
-// ---------- Jukebox logic ----------
-
 function simplify(t) {
   return {
     uri: t.uri,
@@ -161,7 +169,7 @@ const BLOCKED_WHOLE = new Set([
 function words(text) {
   return String(text || '')
     .toLowerCase()
-    .normalize('NFKD').replace(/[̀-ͯ]/g, '') // "fück" -> "fuck"
+    .normalize('NFKD').replace(/\p{M}/gu, '')                     // "fück" -> "fuck"
     .replace(/[@4]/g, 'a').replace(/3/g, 'e').replace(/[1!|]/g, 'i')
     .replace(/0/g, 'o').replace(/[$5]/g, 's').replace(/7/g, 't')  // "sh1t", "$hit"
     .split(/[^a-z]+/)
@@ -182,6 +190,8 @@ function isRudeTrack(t) {
 
 const PARTY_FRIENDLY = "Let's keep it party-friendly 🙂 Try another song.";
 
+// ---------- Search ----------
+
 async function searchTracks(q) {
   if (isRude(q)) throw httpError(400, PARTY_FRIENDLY);
   // Development-mode apps can get at most 10 results per search request.
@@ -196,55 +206,142 @@ async function searchTracks(q) {
     .map(simplify);
 }
 
-let nowCache = null;
-let nowCacheAt = 0;
-async function nowAndNext() {
-  // Cache for 10s so lots of guests polling the page don't burn through Spotify's rate limit.
-  if (nowCache && Date.now() - nowCacheAt < 10_000) return nowCache;
-  const data = await spotify('GET', '/me/player/queue');
-  nowCache = {
-    current: data?.currently_playing ? simplify(data.currently_playing) : null,
-    queue: (data?.queue || []).slice(0, 10).map(simplify),
-  };
-  nowCacheAt = Date.now();
-  return nowCache;
+// ---------- What's playing (shared, cached so many guests don't hit Spotify's rate limit) ----------
+
+let playback = null;     // last answer from Spotify's "playback state"
+let playbackAt = 0;
+let playbackPromise = null;
+
+async function getPlayback() {
+  if (playback && Date.now() - playbackAt < 4000) return playback;
+  if (!playbackPromise) {
+    playbackPromise = spotify('GET', '/me/player')
+      .then(d => { playback = d || {}; playbackAt = Date.now(); return playback; }) // empty = no active device
+      .finally(() => { playbackPromise = null; });
+  }
+  return playbackPromise;
 }
 
-const lastRequestByGuest = new Map(); // ip -> timestamp
-const recentTracks = new Map();       // uri -> timestamp
+// ---------- The request list and voting ----------
 
-function guestId(req) {
-  // Behind a tunnel or hosting proxy every guest shares one socket IP, so prefer the
-  // headers the proxy adds (Cloudflare: CF-Connecting-IP; most others: X-Forwarded-For).
-  // (Spoofable, but fine for a party.)
-  return req.headers['cf-connecting-ip']
-    || req.headers['x-forwarded-for']?.split(',')[0].trim()
-    || req.socket.remoteAddress;
+const waiting = [];              // songs guests added, not yet handed to Spotify
+let playingNext = null;          // the song we've handed to Spotify's queue that hasn't started yet
+const recentlyPlayed = new Map(); // uri -> when we handed it to Spotify
+const lastAddByGuest = new Map(); // guest -> when they last added a song
+let feedProblem = '';            // last problem handing a song to Spotify, shown to guests
+
+function ranked() {
+  // Most votes first; ties go to whoever asked first.
+  return [...waiting].sort((a, b) => b.votes.size - a.votes.size || a.addedAt - b.addedAt);
 }
 
-async function requestSong(req, uri) {
+async function addSong(guest, uri) {
   if (!/^spotify:track:[A-Za-z0-9]{22}$/.test(uri)) throw httpError(400, "That doesn't look like a Spotify track.");
 
-  const guest = guestId(req);
-  const wait = (lastRequestByGuest.get(guest) || 0) + COOLDOWN_MS - Date.now();
-  if (wait > 0) throw httpError(429, `Easy there! You can add another song in ${Math.ceil(wait / 1000)}s.`);
-
-  const last = recentTracks.get(uri);
-  if (last && Date.now() - last < DUPLICATE_WINDOW_MS) throw httpError(409, 'Someone already requested that one recently.');
-
-  // Re-check the song itself, in case someone bypasses the search page.
-  if (!ALLOW_EXPLICIT || WORD_FILTER) {
-    const track = await spotify('GET', '/tracks/' + uri.split(':')[2]);
-    if (!ALLOW_EXPLICIT && track?.explicit) throw httpError(403, 'Explicit songs are turned off tonight.');
-    if (track && isRudeTrack(track)) throw httpError(403, PARTY_FRIENDLY);
+  // Already on the list? Count it as a vote instead.
+  const existing = waiting.find(s => s.uri === uri);
+  if (existing) {
+    existing.votes.add(guest);
+    return { upvoted: true };
   }
+  if (playingNext?.uri === uri) throw httpError(409, "That one's already playing next! 🎶");
+  if (playback?.item?.uri === uri) throw httpError(409, "That one's playing right now! 🎶");
+  const played = recentlyPlayed.get(uri);
+  if (played && Date.now() - played < DUPLICATE_WINDOW_MS) throw httpError(409, 'That one played recently. Pick another!');
 
-  // Note: the Web API can add to the queue but cannot remove or reorder queued songs.
-  await spotify('POST', '/me/player/queue?uri=' + encodeURIComponent(uri));
+  const wait = (lastAddByGuest.get(guest) || 0) + COOLDOWN_MS - Date.now();
+  if (wait > 0) {
+    throw httpError(429, `Easy there! You can add another song in ${Math.ceil(wait / 1000)}s. Voting is unlimited 👍`);
+  }
+  if (waiting.length >= MAX_WAITING) throw httpError(429, 'The list is full right now. Vote for a song instead!');
 
-  lastRequestByGuest.set(guest, Date.now());
-  recentTracks.set(uri, Date.now());
-  nowCache = null;
+  // Look the song up ourselves (don't trust the browser), and re-check the filters.
+  const track = await spotify('GET', '/tracks/' + uri.split(':')[2]);
+  if (!track?.uri) throw httpError(404, "Couldn't find that song.");
+  if (!ALLOW_EXPLICIT && track.explicit) throw httpError(403, 'Explicit songs are turned off tonight.');
+  if (isRudeTrack(track)) throw httpError(403, PARTY_FRIENDLY);
+
+  waiting.push({ ...simplify(track), addedAt: Date.now(), addedBy: guest, votes: new Set([guest]) });
+  lastAddByGuest.set(guest, Date.now());
+  feed(); // hands it to Spotify straight away if the current song is nearly over
+  return { added: true };
+}
+
+function toggleVote(guest, uri) {
+  const song = waiting.find(s => s.uri === uri);
+  if (!song) throw httpError(404, "Too late, that one's already lined up or played!");
+  if (song.votes.has(guest)) song.votes.delete(guest);
+  else song.votes.add(guest);
+  return { votes: song.votes.size, voted: song.votes.has(guest) };
+}
+
+// Every few seconds: when the current song is nearly over, hand the top-voted song to Spotify.
+let feeding = false;
+async function feed() {
+  if (feeding || !tokens || MISSING.length || (!waiting.length && !playingNext)) return;
+  feeding = true;
+  try {
+    const p = await getPlayback();
+    const current = p.item;
+
+    // The song we lined up has started, so it's no longer "next".
+    if (playingNext && current?.uri === playingNext.uri) playingNext = null;
+
+    // Safety net: if our lined-up song vanished (queue cleared, device switched), stop waiting for it.
+    if (playingNext && Date.now() - playingNext.sentAt > 20 * 60_000) {
+      const q = await spotify('GET', '/me/player/queue');
+      if (q?.queue?.some(t => t?.uri === playingNext.uri)) playingNext.sentAt = Date.now();
+      else playingNext = null;
+    }
+
+    if (playingNext || !waiting.length) return;
+    if (!p.device) { feedProblem = "Spotify isn't playing on any device. Host: press play somewhere first."; return; }
+
+    const sinceChecked = p.is_playing ? Date.now() - playbackAt : 0;
+    const remaining = current ? current.duration_ms - (p.progress_ms || 0) - sinceChecked : 0;
+    if (p.is_playing && remaining > LEAD_MS) { feedProblem = ''; return; } // still collecting votes
+
+    const top = ranked()[0];
+    await spotify('POST', '/me/player/queue?uri=' + encodeURIComponent(top.uri));
+    waiting.splice(waiting.indexOf(top), 1);
+    playingNext = { ...top, sentAt: Date.now() };
+    recentlyPlayed.set(top.uri, Date.now());
+    feedProblem = '';
+
+    for (const [uri, at] of recentlyPlayed) if (Date.now() - at > DUPLICATE_WINDOW_MS) recentlyPlayed.delete(uri);
+  } catch (e) {
+    feedProblem = friendlyError(e);
+  } finally {
+    feeding = false;
+  }
+}
+setInterval(feed, 5000);
+
+function publicSong(s) {
+  return { uri: s.uri, name: s.name, artists: s.artists, image: s.image, explicit: s.explicit };
+}
+
+async function nowState(guest) {
+  let current = null;
+  let problem = '';
+  try {
+    const p = await getPlayback();
+    current = p.item ? simplify(p.item) : null;
+    if (!p.device) problem = "Spotify isn't playing on any device. Host: press play somewhere first.";
+  } catch (e) {
+    problem = friendlyError(e);
+  }
+  return {
+    current,
+    problem: problem || feedProblem,
+    next: playingNext ? publicSong(playingNext) : null,
+    waiting: ranked().map(s => ({
+      ...publicSong(s),
+      votes: s.votes.size,
+      voted: s.votes.has(guest),
+      mine: s.addedBy === guest,
+    })),
+  };
 }
 
 function friendlyError(e) {
@@ -257,6 +354,18 @@ function friendlyError(e) {
     return "Spotify doesn't recognise the host's account for this app. Host: add it under User Management in your Spotify developer app settings.";
   }
   return e.message || 'Something went wrong.';
+}
+
+// ---------- Guests: each browser gets a random ID in a cookie ----------
+// (Using IP addresses doesn't work: everyone on the party Wi-Fi shares one.)
+
+function guestFor(req, res) {
+  const match = /(?:^|;\s*)jb_guest=([a-f0-9]{24})/.exec(req.headers.cookie || '');
+  if (match) return match[1];
+  const id = crypto.randomBytes(12).toString('hex');
+  const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `jb_guest=${id}; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly${secure}`);
+  return id;
 }
 
 // ---------- Simple pages for the host (setup, login result) ----------
@@ -338,6 +447,7 @@ const server = http.createServer(async (req, res) => {
     }
     switch (route) {
       case 'GET /':
+        guestFor(req, res); // hand out the guest cookie on first visit
         return send(res, 200, PAGE, html);
 
       case 'GET /login': {
@@ -373,7 +483,7 @@ const server = http.createServer(async (req, res) => {
           expires_at: Date.now() + d.expires_in * 1000, authorized_at: Date.now(),
         };
         saveTokens();
-        nowCache = null;
+        playback = null;
         return send(res, 200, connectedPage(tokens.refresh_token), html);
       }
 
@@ -385,12 +495,16 @@ const server = http.createServer(async (req, res) => {
 
       case 'POST /api/queue': {
         const body = await readJson(req);
-        await requestSong(req, String(body.uri || ''));
-        return sendJson(res, 200, { ok: true });
+        return sendJson(res, 200, await addSong(guestFor(req, res), String(body.uri || '')));
+      }
+
+      case 'POST /api/vote': {
+        const body = await readJson(req);
+        return sendJson(res, 200, toggleVote(guestFor(req, res), String(body.uri || '')));
       }
 
       case 'GET /api/now':
-        return sendJson(res, 200, await nowAndNext());
+        return sendJson(res, 200, await nowState(guestFor(req, res)));
 
       default:
         return send(res, 404, 'Not found');
@@ -434,15 +548,20 @@ const PAGE = `<!doctype html>
   input { flex: 1; min-width: 0; padding: 12px 16px; border-radius: 999px; border: 0; background: var(--field); color: var(--text); font-size: 16px; }
   button { padding: 10px 16px; border-radius: 999px; border: 0; background: var(--accent); color: #000; font-weight: 700; font-size: 15px; cursor: pointer; flex: none; }
   button:disabled { opacity: .5; cursor: default; }
+  button.vote { background: transparent; color: var(--text); border: 2px solid var(--muted); min-width: 64px; }
+  button.vote[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #000; }
   ul { list-style: none; padding: 0; margin: 0; }
   li { display: flex; align-items: center; gap: 12px; padding: 8px; border-radius: 8px; }
   li:nth-child(odd) { background: var(--card); }
   img { width: 48px; height: 48px; border-radius: 4px; flex: none; background: var(--field); }
   .meta { flex: 1; min-width: 0; }
   .title, .artist { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .artist, .empty { color: var(--muted); font-size: .9rem; }
+  .artist, .empty, .hint { color: var(--muted); font-size: .9rem; }
+  .badge { flex: none; font-size: .8rem; font-weight: 700; color: var(--accent); }
+  .hint { margin: -4px 4px 8px; }
   #msg { min-height: 1.4em; margin: 12px 4px 4px; color: var(--accent); }
-  #msg.err { color: var(--error); }
+  #msg.err, #problem { color: var(--error); }
+  #problem { margin: 8px 4px 0; font-size: .9rem; }
 </style>
 </head>
 <body>
@@ -456,8 +575,12 @@ const PAGE = `<!doctype html>
   <ul id="results"></ul>
   <h2>Now playing</h2>
   <ul id="now"></ul>
+  <p id="problem"></p>
   <h2>Up next</h2>
   <ul id="next"></ul>
+  <h2>Vote for what plays next</h2>
+  <p class="hint">Tap 👍 on the songs you want. Most votes plays first.</p>
+  <ul id="waiting"></ul>
 </main>
 <script>
   const $ = id => document.getElementById(id);
@@ -474,7 +597,9 @@ const PAGE = `<!doctype html>
     return li;
   }
 
-  function row(track, onAdd) {
+  // One song row. Options: subtitle (extra text after the artist), badge, button {label, pressed, onClick, className}
+  function row(track, options) {
+    const opts = options || {};
     const li = document.createElement('li');
     const img = document.createElement('img');
     img.alt = '';
@@ -486,13 +611,21 @@ const PAGE = `<!doctype html>
     title.textContent = track.name + (track.explicit ? ' (E)' : '');
     const artist = document.createElement('div');
     artist.className = 'artist';
-    artist.textContent = track.artists;
+    artist.textContent = track.artists + (opts.subtitle ? ' · ' + opts.subtitle : '');
     meta.append(title, artist);
     li.append(img, meta);
-    if (onAdd) {
+    if (opts.badge) {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = opts.badge;
+      li.append(badge);
+    }
+    if (opts.button) {
       const btn = document.createElement('button');
-      btn.textContent = 'Add';
-      btn.onclick = () => onAdd(btn);
+      btn.textContent = opts.button.label;
+      if (opts.button.className) btn.className = opts.button.className;
+      if (opts.button.pressed !== undefined) btn.setAttribute('aria-pressed', String(opts.button.pressed));
+      btn.onclick = () => opts.button.onClick(btn);
       li.append(btn);
     }
     return li;
@@ -505,16 +638,22 @@ const PAGE = `<!doctype html>
     return data;
   }
 
+  function post(path, uri) {
+    return api(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uri: uri }),
+    });
+  }
+
   async function addSong(track, btn) {
     btn.disabled = true;
     try {
-      await api('/api/queue', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uri: track.uri }),
-      });
+      const result = await post('/api/queue', track.uri);
       btn.textContent = 'Added';
-      say('Added "' + track.name + '" to the queue 🎉');
+      say(result.upvoted
+        ? '"' + track.name + '" was already on the list, so we added your vote 👍'
+        : 'Added "' + track.name + '" 🎉 Get your friends to vote for it!');
       refresh();
     } catch (err) {
       btn.disabled = false;
@@ -522,12 +661,22 @@ const PAGE = `<!doctype html>
     }
   }
 
+  async function vote(song, btn) {
+    btn.disabled = true;
+    try {
+      await post('/api/vote', song.uri);
+    } catch (err) {
+      say(err.message, true);
+    }
+    refresh();
+  }
+
   $('search').onsubmit = async event => {
     event.preventDefault();
     say('Searching…');
     try {
       const tracks = await api('/api/search?q=' + encodeURIComponent($('q').value));
-      $('results').replaceChildren(...tracks.map(t => row(t, btn => addSong(t, btn))));
+      $('results').replaceChildren(...tracks.map(t => row(t, { button: { label: 'Add', onClick: btn => addSong(t, btn) } })));
       say(tracks.length ? '' : 'No results. Try different words.');
     } catch (err) {
       say(err.message, true);
@@ -538,15 +687,23 @@ const PAGE = `<!doctype html>
     try {
       const data = await api('/api/now');
       $('now').replaceChildren(data.current ? row(data.current) : note('Nothing playing right now'));
-      $('next').replaceChildren(...(data.queue.length ? data.queue.map(t => row(t)) : [note('Queue is empty')]));
+      $('problem').textContent = data.problem || '';
+      $('next').replaceChildren(data.next
+        ? row(data.next, { badge: '🔒 Locked in' })
+        : note(data.waiting.length ? 'The top-voted song gets locked in near the end of this one' : 'Add a song to get things going!'));
+      $('waiting').replaceChildren(...(data.waiting.length
+        ? data.waiting.map(s => row(s, {
+            subtitle: s.mine ? 'your pick' : '',
+            button: { label: '👍 ' + s.votes, className: 'vote', pressed: s.voted, onClick: btn => vote(s, btn) },
+          }))
+        : [note('No requests yet. Search above to add one!')]));
     } catch (err) {
-      $('now').replaceChildren(note(err.message));
-      $('next').replaceChildren();
+      $('problem').textContent = err.message;
     }
   }
 
   refresh();
-  setInterval(refresh, 15000);
+  setInterval(refresh, 8000);
 </script>
 </body>
 </html>`;
