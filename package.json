@@ -1,0 +1,13 @@
+{
+  "name": "party-jukebox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Guests search Spotify and add songs to the host's queue",
+  "main": "jukebox.js",
+  "scripts": {
+    "start": "node jukebox.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
