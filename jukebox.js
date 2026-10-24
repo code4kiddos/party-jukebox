@@ -19,7 +19,9 @@
 //   REDIRECT_URI=...          must match the Redirect URI in your Spotify dashboard exactly.
 //                             Defaults to <Render URL>/callback on Render, else 127.0.0.1.
 //   COOLDOWN_SECONDS=30       how long each guest waits between requests
-//   ALLOW_EXPLICIT=false      hide and block explicit tracks
+//   ALLOW_EXPLICIT=false      hide and block songs Spotify marks as Explicit (the "E" label)
+//   WORD_FILTER=off           turn off the rude-word filter (it's on by default)
+//   EXTRA_BLOCKED_WORDS=a,b   more words to block, comma-separated (whole words)
 //   SPOTIFY_REFRESH_TOKEN=... lets the jukebox log itself back in after a restart on hosts
 //                             that wipe files (e.g. Render's free tier). The /callback page
 //                             shows you this value after you log in.
@@ -37,6 +39,7 @@ const REDIRECT_URI = process.env.REDIRECT_URI
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 30) * 1000;
 const ALLOW_EXPLICIT = process.env.ALLOW_EXPLICIT !== 'false';
+const WORD_FILTER = process.env.WORD_FILTER !== 'off';
 const DUPLICATE_WINDOW_MS = 60 * 60 * 1000; // same song can't be re-requested within 1 hour
 const TOKEN_FILE = 'tokens.json';
 const SCOPES = 'user-modify-playback-state user-read-playback-state user-read-currently-playing';
@@ -136,7 +139,51 @@ function simplify(t) {
   };
 }
 
+// ---------- Rude-word filter ----------
+// Blocks rude searches, and hides songs whose title, artist or album contains a rude word.
+// It's a simple word list, so it won't catch everything; Spotify's own Explicit label
+// (ALLOW_EXPLICIT=false) is the stronger filter. Use both for a clean party.
+
+// Blocked even inside longer words ("bullshit", "motherfucker").
+const BLOCKED_INSIDE = ['fuck', 'shit'];
+// Blocked when a word starts with them ("bitches", "sluts").
+const BLOCKED_STARTS = ['bitch', 'cunt', 'nigg', 'fagg', 'whore', 'slut', 'twat', 'wank', 'dildo', 'pornh'];
+// Blocked only as whole words, so "class", "assassin" and "cocktail" still work.
+const BLOCKED_WHOLE = new Set([
+  'ass', 'asses', 'asshole', 'assholes', 'arse', 'arsehole', 'dick', 'dicks', 'cock', 'cocks',
+  'pussy', 'pussies', 'porn', 'porno', 'fag', 'fags', 'tits', 'titties', 'boobs', 'cum', 'hoes',
+  'bollocks', 'milf', 'nsfw', 'xxx', 'wtf', 'stfu', 'mf',
+  // Common Singapore/Malaysia ones
+  'knn', 'ccb', 'chibai', 'cheebye', 'lanjiao', 'kanina', 'pukimak', 'puki',
+  ...(process.env.EXTRA_BLOCKED_WORDS || '').split(',').map(w => w.trim().toLowerCase()).filter(Boolean),
+]);
+
+function words(text) {
+  return String(text || '')
+    .toLowerCase()
+    .normalize('NFKD').replace(/[̀-ͯ]/g, '') // "fück" -> "fuck"
+    .replace(/[@4]/g, 'a').replace(/3/g, 'e').replace(/[1!|]/g, 'i')
+    .replace(/0/g, 'o').replace(/[$5]/g, 's').replace(/7/g, 't')  // "sh1t", "$hit"
+    .split(/[^a-z]+/)
+    .filter(Boolean);
+}
+
+function isRude(text) {
+  if (!WORD_FILTER) return false;
+  return words(text).some(w =>
+    BLOCKED_WHOLE.has(w)
+    || BLOCKED_STARTS.some(b => w.startsWith(b))
+    || BLOCKED_INSIDE.some(b => w.includes(b)));
+}
+
+function isRudeTrack(t) {
+  return isRude(t.name) || isRude(t.album?.name) || (t.artists || []).some(a => isRude(a.name));
+}
+
+const PARTY_FRIENDLY = "Let's keep it party-friendly 🙂 Try another song.";
+
 async function searchTracks(q) {
+  if (isRude(q)) throw httpError(400, PARTY_FRIENDLY);
   // Development-mode apps can get at most 10 results per search request.
   // No `market` parameter: with the host's token, Spotify already uses the host's country,
   // and `market=from_token` now fails with "Insufficient client scope".
@@ -145,6 +192,7 @@ async function searchTracks(q) {
   return (data?.tracks?.items || [])
     .filter(Boolean)
     .filter(t => ALLOW_EXPLICIT || !t.explicit)
+    .filter(t => !isRudeTrack(t))
     .map(simplify);
 }
 
@@ -184,9 +232,11 @@ async function requestSong(req, uri) {
   const last = recentTracks.get(uri);
   if (last && Date.now() - last < DUPLICATE_WINDOW_MS) throw httpError(409, 'Someone already requested that one recently.');
 
-  if (!ALLOW_EXPLICIT) {
+  // Re-check the song itself, in case someone bypasses the search page.
+  if (!ALLOW_EXPLICIT || WORD_FILTER) {
     const track = await spotify('GET', '/tracks/' + uri.split(':')[2]);
-    if (track?.explicit) throw httpError(403, 'Explicit songs are turned off tonight.');
+    if (!ALLOW_EXPLICIT && track?.explicit) throw httpError(403, 'Explicit songs are turned off tonight.');
+    if (track && isRudeTrack(track)) throw httpError(403, PARTY_FRIENDLY);
   }
 
   // Note: the Web API can add to the queue but cannot remove or reorder queued songs.
