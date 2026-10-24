@@ -138,7 +138,9 @@ function simplify(t) {
 
 async function searchTracks(q) {
   // Development-mode apps can get at most 10 results per search request.
-  const params = new URLSearchParams({ q, type: 'track', limit: '10', market: 'from_token' });
+  // No `market` parameter: with the host's token, Spotify already uses the host's country,
+  // and `market=from_token` now fails with "Insufficient client scope".
+  const params = new URLSearchParams({ q, type: 'track', limit: '10' });
   const data = await spotify('GET', '/search?' + params);
   return (data?.tracks?.items || [])
     .filter(Boolean)
