@@ -25,8 +25,11 @@
 //                             Defaults to <Render URL>/callback on Render, else 127.0.0.1.
 //   COOLDOWN_SECONDS=30       how long each guest waits between adding songs (votes are unlimited)
 //   LEAD_SECONDS=20           how long before a song ends to hand the next one to Spotify
-//   REPEAT_WINDOW_MINUTES=45  a song (or a remix/live/remastered/clean version of it by the same
-//                             artist) can't be requested again until this long after it played
+//   REPEAT_WINDOW_MINUTES=45  a song (or any version of it: remix, live, remastered, clean, or a
+//                             cover by another artist) can't be requested again until this long
+//                             after it played
+//   ALLOW_COVERS=true         treat versions by different artists as different songs (by default
+//                             any song with the same title counts as the same song)
 //   ALLOW_EXPLICIT=false      hide and block songs Spotify marks as Explicit (the "E" label)
 //   WORD_FILTER=off           turn off the rude-word filter (it's on by default)
 //   EXTRA_BLOCKED_WORDS=a,b   more words to block, comma-separated (whole words)
@@ -37,6 +40,8 @@
 //
 // Pages: /        the guest page, with the QR code at the top.
 //        /screen  a big-screen view for a TV: QR code, now playing, up next and the vote list.
+//        /admin   host controls: remove songs from the list, skip the current song.
+//                 Open /admin?key=YOUR_ADMIN_KEY once; that browser stays signed in for a day.
 //
 // The song list and votes live in memory, so they reset if the server restarts.
 
@@ -199,8 +204,11 @@ const PARTY_FRIENDLY = "Let's keep it party-friendly 🙂 Try another song.";
 
 // ---------- "Same song" detection (catches remixes, live, remastered, clean versions…) ----------
 // Two tracks count as the same song when their titles match once the extras are stripped off
-// ("Song (Remix)", "Song - Live", "Song - 2011 Remaster", "Song [feat. X]", "Song (Taylor's Version)")
-// AND they share at least one artist. Covers by different artists still count as different songs.
+// ("Song (Remix)", "Song - Live", "Song - 2011 Remaster", "Song [feat. X]", "Song (Taylor's Version)"),
+// whoever the artist is, so every "Amazing Grace" counts as one song. The catch: different songs
+// that happen to share a title (Adele's "Hello" and Lionel Richie's "Hello") also count as one.
+// Set ALLOW_COVERS=true to require a shared artist as well.
+const ALLOW_COVERS = process.env.ALLOW_COVERS === 'true';
 
 function plain(text) {
   return String(text || '').toLowerCase().normalize('NFKD').replace(/\p{M}/gu, '');
@@ -223,7 +231,8 @@ function songKey(track) {
 }
 
 function sameSong(a, b) {
-  return a.title === b.title && [...a.artists].some(artist => b.artists.has(artist));
+  if (a.title !== b.title) return false;
+  return !ALLOW_COVERS || [...a.artists].some(artist => b.artists.has(artist));
 }
 
 // Songs seen playing on Spotify (including your own playlist), so they can't be requested again too soon.
@@ -270,6 +279,7 @@ function statusFor(track) {
   const listed = waiting.find(s => sameSong(s.key, key));
   if (listed) return { status: 'listed', listedUri: listed.uri };
   const recent = playedRecently(key);
+  if (recent?.removed) return { status: 'removed' };
   if (recent) return { status: 'recent', minutes: minutesUntilAllowed(recent) };
   return {};
 }
@@ -300,6 +310,7 @@ async function getPlayback() {
 const waiting = [];              // songs guests added, not yet handed to Spotify
 let playingNext = null;          // the song we've handed to Spotify's queue that hasn't started yet
 const lastAddByGuest = new Map(); // guest -> when they last added a song
+const skipWhenPlaying = new Map(); // uri -> when the host removed it after it was already lined up
 let feedProblem = '';            // last problem handing a song to Spotify, shown to guests
 
 function ranked() {
@@ -307,7 +318,7 @@ function ranked() {
   return [...waiting].sort((a, b) => b.votes.size - a.votes.size || a.addedAt - b.addedAt);
 }
 
-async function addSong(guest, uri) {
+async function addSong(guest, uri, isHost = false) {
   if (!/^spotify:track:[A-Za-z0-9]{22}$/.test(uri)) throw httpError(400, "That doesn't look like a Spotify track.");
 
   // Already on the list? Count it as a vote instead.
@@ -318,7 +329,7 @@ async function addSong(guest, uri) {
   }
 
   const wait = (lastAddByGuest.get(guest) || 0) + COOLDOWN_MS - Date.now();
-  if (wait > 0) {
+  if (wait > 0 && !isHost) { // the host doesn't have to wait
     throw httpError(429, `Easy there! You can add another song in ${Math.ceil(wait / 1000)}s. Voting is unlimited 👍`);
   }
   if (waiting.length >= MAX_WAITING) throw httpError(429, 'The list is full right now. Vote for a song instead!');
@@ -340,6 +351,7 @@ async function addSong(guest, uri) {
     return { upvoted: true, name: listed.name };
   }
   const recent = playedRecently(key);
+  if (recent?.removed) throw httpError(409, 'The host took that one off the list. Try another song!');
   if (recent) {
     const mins = minutesUntilAllowed(recent);
     throw httpError(409, `That song (or a version of it) played recently. It can be requested again in about ${mins} min.`);
@@ -349,6 +361,33 @@ async function addSong(guest, uri) {
   lastAddByGuest.set(guest, Date.now());
   feed(); // hands it to Spotify straight away if the current song is nearly over
   return { added: true };
+}
+
+// ---------- Host controls ----------
+
+// Remove a song from the list. A removed song (and its other versions) can't be requested again
+// for REPEAT_WINDOW_MINUTES. If it was already lined up in Spotify's queue, Spotify won't let apps
+// take it out, so the jukebox skips it as soon as it starts.
+function removeSong(uri) {
+  const i = waiting.findIndex(s => s.uri === uri);
+  if (i !== -1) {
+    const [song] = waiting.splice(i, 1);
+    history.push({ key: song.key, at: Date.now(), removed: true });
+    return { removed: song.name };
+  }
+  if (playingNext?.uri === uri) {
+    const song = playingNext;
+    playingNext = null; // so the next top-voted song gets lined up behind it
+    skipWhenPlaying.set(uri, Date.now());
+    history.push({ key: song.key, at: Date.now(), removed: true });
+    return { removed: song.name, willSkip: true };
+  }
+  throw httpError(404, "That song isn't on the list any more.");
+}
+
+async function skipCurrent() {
+  await spotify('POST', '/me/player/next');
+  playback = null; // look again next time someone asks
 }
 
 function toggleVote(guest, uri) {
@@ -362,11 +401,19 @@ function toggleVote(guest, uri) {
 // Every few seconds: when the current song is nearly over, hand the top-voted song to Spotify.
 let feeding = false;
 async function feed() {
-  if (feeding || !tokens || MISSING.length || (!waiting.length && !playingNext)) return;
+  if (feeding || !tokens || MISSING.length || (!waiting.length && !playingNext && !skipWhenPlaying.size)) return;
   feeding = true;
   try {
     const p = await getPlayback();
     const current = p.item;
+
+    // A song the host removed after it was lined up has started: skip it.
+    for (const [uri, at] of skipWhenPlaying) if (Date.now() - at > 30 * 60_000) skipWhenPlaying.delete(uri);
+    if (current && skipWhenPlaying.has(current.uri)) {
+      skipWhenPlaying.delete(current.uri);
+      await skipCurrent();
+      return;
+    }
 
     // The song we lined up has started, so it's no longer "next".
     if (playingNext && current?.uri === playingNext.uri) playingNext = null;
@@ -455,6 +502,19 @@ function guestFor(req, res) {
   return id;
 }
 
+// ---------- The host: /admin?key=ADMIN_KEY gives this browser a host cookie ----------
+
+const ADMIN_TOKEN = ADMIN_KEY ? crypto.createHash('sha256').update('jukebox-host:' + ADMIN_KEY).digest('hex') : '';
+
+function isHost(req) {
+  const match = /(?:^|;\s*)jb_host=([a-f0-9]{64})/.exec(req.headers.cookie || '');
+  return !!(match && ADMIN_TOKEN && crypto.timingSafeEqual(Buffer.from(match[1]), Buffer.from(ADMIN_TOKEN)));
+}
+
+function requireHost(req) {
+  if (!isHost(req)) throw httpError(403, 'Only the host can do that. Open /admin?key=YOUR_ADMIN_KEY first.');
+}
+
 // ---------- Simple pages for the host (setup, login result) ----------
 
 function escapeHtml(s) {
@@ -496,7 +556,8 @@ function connectedPage(refreshToken) {
     That keeps the jukebox logged in when Render restarts it. Treat it like a password.</p>
     <textarea id="t" readonly>${escapeHtml(refreshToken)}</textarea>
     <p><button onclick="navigator.clipboard.writeText(document.getElementById('t').value).then(() => this.textContent = 'Copied!')">Copy code</button></p>
-    <p>Spotify will ask you to log in again in about 6 months. When it does, just repeat this and paste the new code.</p>`);
+    <p>Spotify will ask you to log in again in about 6 months. When it does, just repeat this and paste the new code.</p>
+    <p><b>Host controls</b> (remove or skip songs): open <code>/admin?key=YOUR_ADMIN_KEY</code> on your phone.</p>`);
 }
 
 // ---------- Web server ----------
@@ -535,10 +596,46 @@ const server = http.createServer(async (req, res) => {
     switch (route) {
       case 'GET /':
         guestFor(req, res); // hand out the guest cookie on first visit
-        return send(res, 200, page(false, req), html);
+        return send(res, 200, page('guest', req), html);
 
       case 'GET /screen': // big-screen view for a TV or projector
-        return send(res, 200, page(true, req), html);
+        return send(res, 200, page('screen', req), html);
+
+      case 'GET /admin': { // host controls: remove and skip songs
+        const key = url.searchParams.get('key');
+        if (key !== null) {
+          if (key !== ADMIN_KEY) {
+            return send(res, 403, infoPage('Wrong password', `
+              <p>The <code>?key=</code> part of the link has to match your <code>ADMIN_KEY</code> setting exactly
+              (capitals count).</p>`), html);
+          }
+          // Remember this browser as the host for a day, then drop the password from the address bar.
+          const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+          res.writeHead(302, {
+            Location: '/admin',
+            'Set-Cookie': `jb_host=${ADMIN_TOKEN}; Path=/; Max-Age=86400; SameSite=Lax; HttpOnly${secure}`,
+          });
+          return res.end();
+        }
+        if (!isHost(req)) {
+          return send(res, 403, infoPage('Host controls', `
+            <p>To sign in as the host, open <code>/admin?key=YOUR_ADMIN_KEY</code> (use your real ADMIN_KEY).</p>`), html);
+        }
+        guestFor(req, res);
+        return send(res, 200, page('admin', req), html);
+      }
+
+      case 'POST /api/admin/remove': {
+        requireHost(req);
+        const body = await readJson(req);
+        return sendJson(res, 200, removeSong(String(body.uri || '')));
+      }
+
+      case 'POST /api/admin/skip': {
+        requireHost(req);
+        await skipCurrent();
+        return sendJson(res, 200, { skipped: true });
+      }
 
       case 'GET /login': {
         if (url.searchParams.get('key') !== ADMIN_KEY) {
@@ -585,7 +682,7 @@ const server = http.createServer(async (req, res) => {
 
       case 'POST /api/queue': {
         const body = await readJson(req);
-        return sendJson(res, 200, await addSong(guestFor(req, res), String(body.uri || '')));
+        return sendJson(res, 200, await addSong(guestFor(req, res), String(body.uri || ''), isHost(req)));
       }
 
       case 'POST /api/vote': {
@@ -626,7 +723,10 @@ const PARTY_NAME = process.env.PARTY_NAME || 'ACJC Homecoming 96';
 // The QR code guests scan (made at generatorqr.com; it redirects to this jukebox).
 const QR_IMAGE = 'data:image/png;base64,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';
 
-function page(screen, req) {
+// mode: 'guest' (the normal page), 'screen' (TV view) or 'admin' (host controls)
+function page(mode, req) {
+  const screen = mode === 'screen';
+  const admin = mode === 'admin';
   const name = escapeHtml(PARTY_NAME);
   const host = escapeHtml(req.headers['x-forwarded-host'] || req.headers.host || '');
   const qr = `<img class="qr" src="${QR_IMAGE}" alt="QR code to open the jukebox">`;
@@ -647,7 +747,9 @@ function page(screen, req) {
       <ul id="waiting"></ul>
     </section>
   </div>` : `
-  <div class="hero">${qr}<div>${cta}</div></div>
+  ${admin
+    ? `<p class="host-bar">🎛️ Host controls: tap ✕ twice to remove a song. <a href="/screen">TV view</a> · <a href="/">Guest page</a></p>`
+    : `<div class="hero">${qr}<div>${cta}</div></div>`}
   <h1>${name}</h1>
   <form id="search">
     <input id="q" placeholder="Search for a song or artist" autocomplete="off" required>
@@ -696,6 +798,12 @@ function page(screen, req) {
   #msg.err, #problem { color: var(--error); }
   #problem { margin: 8px 4px 0; font-size: .9rem; }
 
+  /* Host controls */
+  .host-bar { background: #2b2410; border: 1px solid #6b5a1e; color: #f5d76e; border-radius: 8px; padding: 10px 12px; font-size: .9rem; margin: 0 0 8px; }
+  .host-bar a { color: #f5d76e; }
+  button.remove { background: transparent; color: var(--error); border: 2px solid var(--error); min-width: 44px; padding: 8px 12px; }
+  button.remove.armed { background: var(--error); color: #000; }
+
   /* QR code block at the top: always shown, at every screen size */
   .hero { display: flex; align-items: center; gap: 20px; margin: 8px 0 16px; }
   .hero .qr { width: 160px; height: 160px; padding: 8px; border-radius: 12px; background: #fff; flex: none; }
@@ -724,12 +832,14 @@ function page(screen, req) {
   }
 </style>
 </head>
-<body${screen ? ' class="screen"' : ''}>
+<body${screen ? ' class="screen"' : admin ? ' class="admin"' : ''}>
 <main>${body}
 </main>
 <script>
   const $ = id => document.getElementById(id);
   const SCREEN = document.body.classList.contains('screen');
+  const ADMIN = document.body.classList.contains('admin');
+  let holdRefreshUntil = 0; // pause redrawing while the host decides on a two-tap button
 
   function say(text, isError) {
     $('msg').textContent = text;
@@ -743,7 +853,23 @@ function page(screen, req) {
     return li;
   }
 
-  // One song row. Options: subtitle (extra text after the artist), badge, button {label, pressed, onClick, className}
+  // Risky buttons need two taps: the first turns it into "Sure?", the second does it.
+  function confirmTap(btn, b) {
+    if (btn.classList.contains('armed')) {
+      holdRefreshUntil = 0;
+      b.onClick(btn);
+      return;
+    }
+    btn.classList.add('armed');
+    btn.textContent = 'Sure?';
+    holdRefreshUntil = Date.now() + 4000;
+    setTimeout(() => {
+      if (btn.classList.contains('armed')) { btn.classList.remove('armed'); btn.textContent = b.label; }
+    }, 4000);
+  }
+
+  // One song row. Options: subtitle (extra text after the artist), badge, big (large cover),
+  // buttons: [{label, onClick, className, pressed, disabled, confirm}] (or a single "button")
   function row(track, options) {
     const opts = options || {};
     const li = document.createElement('li');
@@ -767,15 +893,17 @@ function page(screen, req) {
       badge.textContent = opts.badge;
       li.append(badge);
     }
-    if (opts.button) {
+    const buttons = opts.buttons || (opts.button ? [opts.button] : []);
+    buttons.forEach(b => {
       const btn = document.createElement('button');
-      btn.textContent = opts.button.label;
-      if (opts.button.className) btn.className = opts.button.className;
-      if (opts.button.pressed !== undefined) btn.setAttribute('aria-pressed', String(opts.button.pressed));
-      if (opts.button.disabled) btn.disabled = true;
-      else btn.onclick = () => opts.button.onClick(btn);
+      btn.textContent = b.label;
+      if (b.className) btn.className = b.className;
+      if (b.pressed !== undefined) btn.setAttribute('aria-pressed', String(b.pressed));
+      if (b.disabled) btn.disabled = true;
+      else if (b.confirm) btn.onclick = () => confirmTap(btn, b);
+      else btn.onclick = () => b.onClick(btn);
       li.append(btn);
-    }
+    });
     return li;
   }
 
@@ -819,6 +947,26 @@ function page(screen, req) {
     refresh();
   }
 
+  // Host only: remove a song, or skip the one playing.
+  async function hostAction(path, uri, btn, doneText) {
+    btn.disabled = true;
+    try {
+      const result = await post(path, uri);
+      say(doneText(result));
+    } catch (err) {
+      say(err.message, true);
+    }
+    refresh();
+  }
+
+  function removeButton(song) {
+    return {
+      label: '✕', className: 'remove', confirm: true,
+      onClick: btn => hostAction('/api/admin/remove', song.uri, btn, r => 'Removed "' + r.removed + '"'
+        + (r.willSkip ? '. It was already lined up in Spotify, so it will be skipped as soon as it starts.' : '')),
+    };
+  }
+
   // What the button next to a search result does, depending on whether the song
   // (or another version of it) is already playing, lined up, on the list, or played recently.
   function searchOptions(t) {
@@ -830,6 +978,7 @@ function page(screen, req) {
     if (t.status === 'recent') {
       return { subtitle: 'played recently, back in ' + t.minutes + ' min', button: { label: 'Played', disabled: true } };
     }
+    if (t.status === 'removed') return { subtitle: 'removed by the host', button: { label: 'Removed', disabled: true } };
     return { button: { label: 'Add', onClick: btn => addSong(t, btn) } };
   }
 
@@ -846,12 +995,18 @@ function page(screen, req) {
   };
 
   async function refresh() {
+    if (Date.now() < holdRefreshUntil) return;
     try {
       const data = await api('/api/now');
-      $('now').replaceChildren(data.current ? row(data.current, { big: SCREEN }) : note('Nothing playing right now'));
+      $('now').replaceChildren(data.current
+        ? row(data.current, ADMIN
+          ? { buttons: [{ label: 'Skip ⏭', className: 'remove', confirm: true,
+              onClick: btn => hostAction('/api/admin/skip', '', btn, () => 'Skipped ⏭') }] }
+          : { big: SCREEN })
+        : note('Nothing playing right now'));
       $('problem').textContent = data.problem || '';
       $('next').replaceChildren(data.next
-        ? row(data.next, { badge: '🔒 Locked in' })
+        ? row(data.next, ADMIN ? { badge: '🔒', buttons: [removeButton(data.next)] } : { badge: '🔒 Locked in' })
         : note(data.waiting.length ? 'The top-voted song gets locked in near the end of this one' : 'Add a song to get things going!'));
       if (SCREEN) {
         // Big screen: show the top 7 with their vote counts (no buttons, nobody taps the TV)
@@ -863,7 +1018,8 @@ function page(screen, req) {
       $('waiting').replaceChildren(...(data.waiting.length
         ? data.waiting.map(s => row(s, {
             subtitle: s.mine ? 'your pick' : '',
-            button: { label: '👍 ' + s.votes, className: 'vote', pressed: s.voted, onClick: btn => vote(s, btn) },
+            buttons: [{ label: '👍 ' + s.votes, className: 'vote', pressed: s.voted, onClick: btn => vote(s, btn) }]
+              .concat(ADMIN ? [removeButton(s)] : []),
           }))
         : [note('No requests yet. Search above to add one!')]));
     } catch (err) {
