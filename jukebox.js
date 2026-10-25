@@ -35,7 +35,7 @@
 //                             that wipe files (e.g. Render's free tier). The /callback page
 //                             shows you this value after you log in.
 //
-// Pages: /        the guest page (phones). On laptops and TVs it also shows the QR code.
+// Pages: /        the guest page, with the QR code at the top.
 //        /screen  a big-screen view for a TV: QR code, now playing, up next and the vote list.
 //
 // The song list and votes live in memory, so they reset if the server restarts.
@@ -696,12 +696,11 @@ function page(screen, req) {
   #msg.err, #problem { color: var(--error); }
   #problem { margin: 8px 4px 0; font-size: .9rem; }
 
-  /* QR code block: shown on laptops and TVs, hidden on phones (they're already here) */
-  .hero { display: none; align-items: center; gap: 20px; margin: 8px 0 16px; }
+  /* QR code block at the top: always shown, at every screen size */
+  .hero { display: flex; align-items: center; gap: 20px; margin: 8px 0 16px; }
   .hero .qr { width: 160px; height: 160px; padding: 8px; border-radius: 12px; background: #fff; flex: none; }
   .cta { font-size: 1.25rem; font-weight: 700; color: var(--accent); margin: 0 0 6px; }
   .url { color: var(--muted); margin: 0; word-break: break-all; }
-  @media (min-width: 900px) { .hero { display: flex; } }
 
   /* Big-screen view (/screen): sized to read from across the room */
   body.screen main { max-width: none; padding: 4vh 4vw; }
