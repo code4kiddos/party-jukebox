@@ -390,6 +390,54 @@ async function skipCurrent() {
   playback = null; // look again next time someone asks
 }
 
+// The host's Skip button. Guest songs normally reach Spotify's queue only ~20s before the current
+// song ends, so a skip in the middle of a song would land on your playlist instead. So: line up the
+// top-voted song first, wait until Spotify shows it in the queue, then skip.
+function hostSkip() {
+  return exclusive(async () => {
+    if (!playingNext && waiting.length) {
+      const song = await handOffTop();
+      if (song) await waitUntilQueued(song.uri);
+    }
+    await skipCurrent();
+    return { skipped: true, next: playingNext?.name || null };
+  });
+}
+
+// Spotify doesn't promise to apply "add to queue" before a "skip" sent right after it,
+// so check the queue for up to ~3 seconds before skipping.
+async function waitUntilQueued(uri) {
+  for (let i = 0; i < 6; i++) {
+    const q = await spotify('GET', '/me/player/queue').catch(() => null);
+    if (q?.queue?.some(t => t?.uri === uri)) return true;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return false;
+}
+
+// Hands the top-voted song to Spotify's queue and locks it in as "Up next". Returns it (or null).
+async function handOffTop() {
+  // Drop any waiting song whose version played in the meantime (e.g. from your own playlist).
+  for (const song of [...waiting]) {
+    if (playedRecently(song.key)) waiting.splice(waiting.indexOf(song), 1);
+  }
+  if (!waiting.length) return null;
+  const top = ranked()[0];
+  await spotify('POST', '/me/player/queue?uri=' + encodeURIComponent(top.uri));
+  waiting.splice(waiting.indexOf(top), 1);
+  playingNext = { ...top, sentAt: Date.now() };
+  feedProblem = '';
+  return top;
+}
+
+// Runs one queue change at a time, so the timer and the host's Skip can't both line up a song.
+let busy = Promise.resolve();
+function exclusive(fn) {
+  const run = busy.then(fn, fn);
+  busy = run.catch(() => {});
+  return run;
+}
+
 function toggleVote(guest, uri) {
   const song = waiting.find(s => s.uri === uri);
   if (!song) throw httpError(404, "Too late, that one's already lined up or played!");
@@ -404,45 +452,7 @@ async function feed() {
   if (feeding || !tokens || MISSING.length || (!waiting.length && !playingNext && !skipWhenPlaying.size)) return;
   feeding = true;
   try {
-    const p = await getPlayback();
-    const current = p.item;
-
-    // A song the host removed after it was lined up has started: skip it.
-    for (const [uri, at] of skipWhenPlaying) if (Date.now() - at > 30 * 60_000) skipWhenPlaying.delete(uri);
-    if (current && skipWhenPlaying.has(current.uri)) {
-      skipWhenPlaying.delete(current.uri);
-      await skipCurrent();
-      return;
-    }
-
-    // The song we lined up has started, so it's no longer "next".
-    if (playingNext && current?.uri === playingNext.uri) playingNext = null;
-
-    // Safety net: if our lined-up song vanished (queue cleared, device switched), stop waiting for it.
-    if (playingNext && Date.now() - playingNext.sentAt > 20 * 60_000) {
-      const q = await spotify('GET', '/me/player/queue');
-      if (q?.queue?.some(t => t?.uri === playingNext.uri)) playingNext.sentAt = Date.now();
-      else playingNext = null;
-    }
-
-    if (playingNext || !waiting.length) return;
-    if (!p.device) { feedProblem = "Spotify isn't playing on any device. Host: press play somewhere first."; return; }
-
-    const sinceChecked = p.is_playing ? Date.now() - playbackAt : 0;
-    const remaining = current ? current.duration_ms - (p.progress_ms || 0) - sinceChecked : 0;
-    if (p.is_playing && remaining > LEAD_MS) { feedProblem = ''; return; } // still collecting votes
-
-    // Drop any waiting song whose version played in the meantime (e.g. from your own playlist).
-    for (const song of [...waiting]) {
-      if (playedRecently(song.key)) waiting.splice(waiting.indexOf(song), 1);
-    }
-    if (!waiting.length) return;
-
-    const top = ranked()[0];
-    await spotify('POST', '/me/player/queue?uri=' + encodeURIComponent(top.uri));
-    waiting.splice(waiting.indexOf(top), 1);
-    playingNext = { ...top, sentAt: Date.now() };
-    feedProblem = '';
+    await exclusive(feedOnce);
   } catch (e) {
     feedProblem = friendlyError(e);
   } finally {
@@ -450,6 +460,38 @@ async function feed() {
   }
 }
 setInterval(feed, 5000);
+
+async function feedOnce() {
+  const p = await getPlayback();
+  const current = p.item;
+
+  // A song the host removed after it was lined up has started: skip it.
+  for (const [uri, at] of skipWhenPlaying) if (Date.now() - at > 30 * 60_000) skipWhenPlaying.delete(uri);
+  if (current && skipWhenPlaying.has(current.uri)) {
+    skipWhenPlaying.delete(current.uri);
+    await skipCurrent();
+    return;
+  }
+
+  // The song we lined up has started, so it's no longer "next".
+  if (playingNext && current?.uri === playingNext.uri) playingNext = null;
+
+  // Safety net: if our lined-up song vanished (queue cleared, device switched), stop waiting for it.
+  if (playingNext && Date.now() - playingNext.sentAt > 20 * 60_000) {
+    const q = await spotify('GET', '/me/player/queue');
+    if (q?.queue?.some(t => t?.uri === playingNext.uri)) playingNext.sentAt = Date.now();
+    else playingNext = null;
+  }
+
+  if (playingNext || !waiting.length) return;
+  if (!p.device) { feedProblem = "Spotify isn't playing on any device. Host: press play somewhere first."; return; }
+
+  const sinceChecked = p.is_playing ? Date.now() - playbackAt : 0;
+  const remaining = current ? current.duration_ms - (p.progress_ms || 0) - sinceChecked : 0;
+  if (p.is_playing && remaining > LEAD_MS) { feedProblem = ''; return; } // still collecting votes
+
+  await handOffTop();
+}
 
 function publicSong(s) {
   return { uri: s.uri, name: s.name, artists: s.artists, image: s.image, cover: s.cover, explicit: s.explicit };
@@ -633,8 +675,7 @@ const server = http.createServer(async (req, res) => {
 
       case 'POST /api/admin/skip': {
         requireHost(req);
-        await skipCurrent();
-        return sendJson(res, 200, { skipped: true });
+        return sendJson(res, 200, await hostSkip());
       }
 
       case 'GET /login': {
@@ -1001,7 +1042,7 @@ function page(mode, req) {
       $('now').replaceChildren(data.current
         ? row(data.current, ADMIN
           ? { buttons: [{ label: 'Skip ⏭', className: 'remove', confirm: true,
-              onClick: btn => hostAction('/api/admin/skip', '', btn, () => 'Skipped ⏭') }] }
+              onClick: btn => hostAction('/api/admin/skip', '', btn, r => 'Skipped ⏭' + (r.next ? ' Now playing: "' + r.next + '"' : '')) }] }
           : { big: SCREEN })
         : note('Nothing playing right now'));
       $('problem').textContent = data.problem || '';
